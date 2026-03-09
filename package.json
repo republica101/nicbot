@@ -1,0 +1,16 @@
+{
+  "name": "nicbot",
+  "version": "1.0.0",
+  "description": "Nicotine taper accountability Discord bot",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.21.0"
+  }
+}
