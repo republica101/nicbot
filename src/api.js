@@ -64,6 +64,46 @@ app.get('/api/week', (_req, res) => {
   });
 });
 
+// Full snapshot for external sync (Google Sheets, etc.)
+app.get('/api/snapshot', (_req, res) => {
+  const phase = getCurrentPhase();
+  const today = stmts.todayCount.get();
+  const week = stmts.weekLogs.all();
+  const last = stmts.lastUsedTimestamp.get();
+
+  const avgCount = week.length > 0
+    ? (week.reduce((sum, d) => sum + d.count, 0) / week.length).toFixed(1)
+    : 0;
+
+  res.json({
+    timestamp: new Date().toISOString(),
+    day: phase.day + 1,
+    phase: phase.label,
+    targetMg: phase.mg,
+    targetCount: phase.dailyTarget,
+    intervalMin: phase.intervalMin,
+    today: {
+      count: today.count,
+      totalMg: today.totalMg,
+      overTarget: today.count > phase.dailyTarget,
+    },
+    week: week.map(d => ({
+      date: d.day,
+      count: d.count,
+      totalMg: d.totalMg,
+      skipped: d.skipped,
+    })),
+    avgDailyCount: parseFloat(avgCount),
+    lastUsed: last?.timestamp || null,
+    daysUntilNext: phase.daysUntilNext,
+    nextPhase: phase.nextPhase ? {
+      label: phase.nextPhase.label,
+      mg: phase.nextPhase.mg,
+      intervalMin: phase.nextPhase.intervalMin,
+    } : null,
+  });
+});
+
 // Arbitrary range logs
 app.get('/api/logs', (req, res) => {
   const days = parseInt(req.query.days) || 7;
