@@ -1,6 +1,6 @@
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
 const { stmts } = require('./db');
-const { getCurrentPhase, formatPhaseStatus } = require('./taper');
+const { getCurrentPhase, formatPhaseStatus, PHASES } = require('./taper');
 
 const client = new Client({
   intents: [
@@ -54,6 +54,126 @@ function todaySummary() {
   const indicator = count > target ? '🔴' : count === target ? '🟡' : '🟢';
 
   return `${indicator} ${count}/${target} today | ${phase.mg}mg | last: ${formatTimeSince(last?.timestamp)}`;
+}
+
+function getStreak() {
+  const phase = getCurrentPhase();
+  const days = stmts.dailyUseCounts.all();
+  const today = new Date().toISOString().split('T')[0];
+  let streak = 0;
+
+  for (let i = 0; i < days.length; i++) {
+    const row = days[i];
+    // Skip today (incomplete day)
+    if (i === 0 && row.day === today) {
+      if (row.count <= phase.dailyTarget) streak++;
+      continue;
+    }
+    if (row.count <= phase.dailyTarget) {
+      streak++;
+    } else {
+      break;
+    }
+  }
+  return streak;
+}
+
+function getAvgGapMin(timestamps) {
+  if (timestamps.length < 2) return null;
+  let totalGap = 0;
+  for (let i = 1; i < timestamps.length; i++) {
+    const prev = new Date(timestamps[i - 1].timestamp + 'Z').getTime();
+    const curr = new Date(timestamps[i].timestamp + 'Z').getTime();
+    totalGap += curr - prev;
+  }
+  return Math.round(totalGap / (timestamps.length - 1) / 60000);
+}
+
+function progressBar(current, total, width = 10) {
+  const filled = Math.round((current / total) * width);
+  const empty = width - filled;
+  return '█'.repeat(Math.min(filled, width)) + '░'.repeat(Math.max(empty, 0));
+}
+
+function mgBudgetRemaining() {
+  const phase = getCurrentPhase();
+  const today = stmts.todayCount.get();
+  const remaining = Math.max(phase.dailyTarget - today.count, 0);
+  const mgLeft = remaining * phase.mg;
+  return { remaining, mgLeft };
+}
+
+let endOfDayTimeout = null;
+
+function scheduleEndOfDay() {
+  if (endOfDayTimeout) clearTimeout(endOfDayTimeout);
+
+  const now = new Date();
+  const eod = new Date(now);
+  const eodHour = parseInt(process.env.EOD_HOUR || '22'); // default 10pm
+  eod.setHours(eodHour, 0, 0, 0);
+  if (eod <= now) eod.setDate(eod.getDate() + 1);
+
+  const delay = eod - now;
+  console.log(`End-of-day summary scheduled in ${Math.round(delay / 3600000)}h`);
+
+  endOfDayTimeout = setTimeout(async () => {
+    const phase = getCurrentPhase();
+    const today = stmts.todayCount.get();
+    const streak = getStreak();
+    const todayTs = stmts.todayUseTimestamps.all();
+    const avgGap = getAvgGapMin(todayTs);
+    const skips = stmts.weekSkipCount.get();
+
+    let msg = `🌙 **End of Day Summary — Day ${phase.day + 1}**\n`;
+    msg += `${todaySummary()}\n`;
+    msg += `Streak: ${streak} day${streak !== 1 ? 's' : ''} at/under target\n`;
+    if (avgGap) msg += `Avg gap between pouches: ${avgGap}min\n`;
+    if (skips.count > 0) msg += `Cravings resisted this week: ${skips.count}\n`;
+
+    if (today.count <= phase.dailyTarget) {
+      msg += `\nNice work today.`;
+    } else {
+      const over = today.count - phase.dailyTarget;
+      msg += `\n${over} over target today. Tomorrow's a new day.`;
+    }
+
+    await sendDM(msg);
+    scheduleEndOfDay(); // schedule next
+  }, delay);
+}
+
+async function checkMilestones() {
+  const phase = getCurrentPhase();
+  const today = stmts.todayCount.get();
+  const streak = getStreak();
+  const messages = [];
+
+  const checks = [
+    { key: 'day_1', condition: phase.day >= 0, msg: `🎉 **Day 1!** The taper begins. You got this.` },
+    { key: 'day_7', condition: phase.day >= 6, msg: `🎉 **One week in!** 7 days of taper complete.` },
+    { key: 'day_14', condition: phase.day >= 13, msg: `🎉 **Two weeks!** Halfway through the first month.` },
+    { key: 'day_30', condition: phase.day >= 29, msg: `🎉 **30 days!** A full month of tapering.` },
+    { key: 'streak_3', condition: streak >= 3, msg: `🔥 **3-day streak!** Three days at/under target in a row.` },
+    { key: 'streak_7', condition: streak >= 7, msg: `🔥 **7-day streak!** A full week at/under target!` },
+    { key: 'streak_14', condition: streak >= 14, msg: `🔥 **14-day streak!** Two weeks of discipline.` },
+    { key: 'under_50mg', condition: today.totalMg > 0 && today.totalMg < 50, msg: `💪 **Under 50mg today!** First time below 50mg in a day.` },
+    { key: 'phase_2', condition: phase.label === 'Phase 2', msg: `⬇️ **Phase 2 unlocked!** Stepping down to ${phase.mg}mg.` },
+    { key: 'phase_3', condition: phase.label === 'Phase 3', msg: `⬇️ **Phase 3!** Intervals widening to ${phase.intervalMin}min.` },
+    { key: 'phase_4', condition: phase.label === 'Phase 4', msg: `⬇️ **Phase 4!** Down to ${phase.mg}mg.` },
+    { key: 'phase_5', condition: phase.label === 'Phase 5', msg: `⬇️ **Phase 5!** 2-hour intervals now.` },
+    { key: 'phase_6', condition: phase.label === 'Phase 6', msg: `⬇️ **Phase 6!** 3-hour intervals. Almost there.` },
+    { key: 'final', condition: phase.label === 'Final', msg: `🏁 **Final phase!** 1mg, 4 per day. The finish line is in sight.` },
+  ];
+
+  for (const { key, condition, msg } of checks) {
+    if (condition && !stmts.getMilestone.get(key)) {
+      stmts.setMilestone.run(key);
+      messages.push(msg);
+    }
+  }
+
+  return messages;
 }
 
 // --- Ping Scheduling (fires X min after last use) ---
@@ -138,6 +258,10 @@ client.on('messageCreate', async (message) => {
       if (mg > phase.mg) {
         reply += `\n⚠️ Target is ${phase.mg}mg this phase`;
       }
+
+      const milestones = await checkMilestones();
+      if (milestones.length > 0) reply += '\n\n' + milestones.join('\n');
+
       await message.reply(reply);
       return;
     }
@@ -148,6 +272,19 @@ client.on('messageCreate', async (message) => {
   if (useMatch) {
     const count = parseInt(useMatch[1]);
     const mg = useMatch[2] ? parseInt(useMatch[2]) : phase.mg;
+
+    // Check if logging early (before interval is up)
+    const last = stmts.lastUsedTimestamp.get();
+    let earlyWarning = '';
+    if (last?.timestamp) {
+      const elapsed = Date.now() - new Date(last.timestamp + 'Z').getTime();
+      const intervalMs = phase.intervalMin * 60 * 1000;
+      const remaining = intervalMs - elapsed;
+      if (remaining > 60000) { // more than 1 min early
+        const minLeft = Math.round(remaining / 60000);
+        earlyWarning = `\n⏳ That's ${minLeft}min early — can you wait a bit longer?`;
+      }
+    }
 
     for (let i = 0; i < count; i++) {
       stmts.logUse.run('used', mg, null);
@@ -162,6 +299,11 @@ client.on('messageCreate', async (message) => {
     if (mg > phase.mg) {
       reply += `\n⚠️ Target is ${phase.mg}mg this phase`;
     }
+    reply += earlyWarning;
+
+    // Check milestones
+    const milestones = await checkMilestones();
+    if (milestones.length > 0) reply += '\n\n' + milestones.join('\n');
 
     await message.reply(reply);
     return;
@@ -191,9 +333,21 @@ client.on('messageCreate', async (message) => {
     const phaseStatus = formatPhaseStatus(phase);
     const summary = todaySummary();
     const last = stmts.lastUsedTimestamp.get();
+    const streak = getStreak();
+    const budget = mgBudgetRemaining();
 
-    let reply = `📊 **Status**\n${phaseStatus}\n${summary}`;
-    if (last) reply += `\nLast pouch: ${formatTimeSince(last.timestamp)}`;
+    // Phase progress bar
+    const totalDays = PHASES[PHASES.length - 1].startDay + 14; // final phase + 2 weeks
+    const phaseDaysIn = phase.day - phase.startDay;
+    const phaseDaysTotal = phase.nextPhase ? phase.nextPhase.startDay - phase.startDay : 14;
+
+    let reply = `📊 **Status**\n${phaseStatus}\n`;
+    reply += `Phase: ${progressBar(phaseDaysIn, phaseDaysTotal)} ${phaseDaysIn}/${phaseDaysTotal} days\n`;
+    reply += `Overall: ${progressBar(phase.day, totalDays)} Day ${phase.day + 1}/${totalDays}\n`;
+    reply += `${summary}\n`;
+    if (last) reply += `Last pouch: ${formatTimeSince(last.timestamp)}\n`;
+    reply += `Streak: ${streak} day${streak !== 1 ? 's' : ''} at/under target\n`;
+    reply += `Budget: ${budget.remaining} pouches left (${budget.mgLeft}mg)`;
 
     await message.reply(reply);
     return;
@@ -216,6 +370,22 @@ client.on('messageCreate', async (message) => {
       reply += `${d.padEnd(10)} | ${String(row.count).padStart(4)} | ${String(row.totalMg).padStart(4)} | ${String(row.skipped).padStart(5)}\n`;
     }
     reply += '```';
+
+    // Weekly comparison
+    const thisWeek = stmts.thisWeekTotal.get();
+    const lastWeek = stmts.lastWeekTotal.get();
+    if (lastWeek.count > 0) {
+      const countDiff = thisWeek.count - lastWeek.count;
+      const mgDiff = thisWeek.totalMg - lastWeek.totalMg;
+      const sign = (n) => n > 0 ? `+${n}` : `${n}`;
+      reply += `\nvs last week: ${sign(countDiff)} pouches, ${sign(mgDiff)}mg`;
+    }
+
+    // Craving resistance
+    const skips = stmts.weekSkipCount.get();
+    if (skips.count > 0) {
+      reply += `\n💪 Resisted ${skips.count} craving${skips.count !== 1 ? 's' : ''} this week`;
+    }
 
     await message.reply(reply);
     return;
@@ -285,6 +455,68 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
+  // --- Insights (avg gap, time-of-day breakdown) ---
+  if (content === 'insights' || content === 'i') {
+    const todayTs = stmts.todayUseTimestamps.all();
+    const weekTs = stmts.weekUseTimestamps.all();
+    const tod = stmts.timeOfDayBreakdown.get();
+
+    let reply = '🔍 **Insights (last 7 days)**\n';
+
+    // Today's avg gap
+    const todayGap = getAvgGapMin(todayTs);
+    if (todayGap) {
+      reply += `\nToday's avg gap: **${todayGap}min** (target: ${phase.intervalMin}min)`;
+      if (todayGap >= phase.intervalMin) reply += ' ✅';
+      else reply += ` — ${phase.intervalMin - todayGap}min short`;
+    }
+
+    // Weekly avg gap
+    // Group timestamps by day and compute avg gap per day
+    const byDay = {};
+    for (const row of weekTs) {
+      const day = row.timestamp.split('T')[0] || row.timestamp.split(' ')[0];
+      if (!byDay[day]) byDay[day] = [];
+      byDay[day].push(row);
+    }
+    const dailyGaps = [];
+    for (const [, rows] of Object.entries(byDay)) {
+      const gap = getAvgGapMin(rows);
+      if (gap) dailyGaps.push(gap);
+    }
+    if (dailyGaps.length > 0) {
+      const avgWeekGap = Math.round(dailyGaps.reduce((a, b) => a + b, 0) / dailyGaps.length);
+      reply += `\nWeek avg gap: **${avgWeekGap}min**`;
+    }
+
+    // Time of day breakdown
+    if (tod) {
+      const total = (tod.morning || 0) + (tod.afternoon || 0) + (tod.evening || 0) + (tod.night || 0);
+      if (total > 0) {
+        reply += `\n\n**When you use most:**\n`;
+        const periods = [
+          { label: 'Morning (6-12)', count: tod.morning || 0 },
+          { label: 'Afternoon (12-6)', count: tod.afternoon || 0 },
+          { label: 'Evening (6-12)', count: tod.evening || 0 },
+          { label: 'Night (12-6)', count: tod.night || 0 },
+        ];
+        const maxCount = Math.max(...periods.map(p => p.count), 1);
+        for (const p of periods) {
+          const bar = progressBar(p.count, maxCount, 8);
+          const pct = Math.round(p.count / total * 100);
+          reply += `${p.label.padEnd(18)} ${bar} ${p.count} (${pct}%)\n`;
+        }
+
+        // Flag heaviest period
+        const heaviest = periods.reduce((a, b) => a.count > b.count ? a : b);
+        reply += `\nHeaviest: **${heaviest.label}**`;
+      }
+    }
+
+    await message.reply(reply);
+    return;
+  }
+
   // --- Help ---
   if (content === 'help' || content === 'h' || content === '?') {
     await message.reply(
@@ -293,10 +525,12 @@ client.on('messageCreate', async (message) => {
       '`1 6` or `2 4` — log with explicit mg\n' +
       '`skip` / `s` — log a skipped craving\n' +
       '`undo` / `u` — remove last entry\n' +
-      '`status` / `st` — current phase + today\'s count\n' +
-      '`stats` / `week` — last 7 days summary\n' +
+      '`status` / `st` — phase, streak, progress, mg budget\n' +
+      '`stats` / `week` — last 7 days + weekly comparison\n' +
       '`graph` / `g` — last 24h mg usage graph\n' +
-      '`help` / `h` — this message'
+      '`insights` / `i` — avg gap, time-of-day breakdown\n' +
+      '`help` / `h` — this message\n\n' +
+      '_Auto: end-of-day summary at 10pm, milestones on achievements_'
     );
     return;
   }
@@ -336,6 +570,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
 client.once('ready', () => {
   console.log(`NicBot online as ${client.user.tag}`);
   schedulePing();
+  scheduleEndOfDay();
 });
 
 function login() {

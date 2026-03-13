@@ -26,6 +26,12 @@ db.exec(`
     responded INTEGER NOT NULL DEFAULT 0,
     response_type TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS milestones (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT NOT NULL UNIQUE,
+    achieved_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
 
 const stmts = {
@@ -92,6 +98,74 @@ const stmts = {
     AND timestamp >= datetime('now', '-24 hours')
     ORDER BY timestamp ASC
   `),
+
+  // Streak: consecutive days at or under a given daily target (param: target count)
+  // Returns all days with usage counts, ordered descending, so we can count streak in JS
+  dailyUseCounts: db.prepare(`
+    SELECT date(timestamp) as day,
+           COUNT(*) as count
+    FROM logs
+    WHERE type IN ('used', 'ping_used')
+    GROUP BY date(timestamp)
+    ORDER BY day DESC
+  `),
+
+  // Time gaps between consecutive uses today
+  todayUseTimestamps: db.prepare(`
+    SELECT timestamp FROM logs
+    WHERE type IN ('used', 'ping_used')
+    AND date(timestamp) = date('now')
+    ORDER BY timestamp ASC
+  `),
+
+  // Average gap between uses per day over last 7 days
+  weekUseTimestamps: db.prepare(`
+    SELECT timestamp FROM logs
+    WHERE type IN ('used', 'ping_used')
+    AND timestamp >= datetime('now', '-7 days')
+    ORDER BY timestamp ASC
+  `),
+
+  // Time-of-day breakdown (uses per period: morning/afternoon/evening/night)
+  timeOfDayBreakdown: db.prepare(`
+    SELECT
+      SUM(CASE WHEN CAST(strftime('%H', timestamp) AS INTEGER) BETWEEN 6 AND 11 THEN 1 ELSE 0 END) as morning,
+      SUM(CASE WHEN CAST(strftime('%H', timestamp) AS INTEGER) BETWEEN 12 AND 17 THEN 1 ELSE 0 END) as afternoon,
+      SUM(CASE WHEN CAST(strftime('%H', timestamp) AS INTEGER) BETWEEN 18 AND 23 THEN 1 ELSE 0 END) as evening,
+      SUM(CASE WHEN CAST(strftime('%H', timestamp) AS INTEGER) BETWEEN 0 AND 5 THEN 1 ELSE 0 END) as night
+    FROM logs
+    WHERE type IN ('used', 'ping_used')
+    AND timestamp >= datetime('now', '-7 days')
+  `),
+
+  // This week vs last week comparison
+  thisWeekTotal: db.prepare(`
+    SELECT COUNT(*) as count, COALESCE(SUM(mg), 0) as totalMg,
+           COUNT(CASE WHEN type IN ('skipped', 'ping_skipped') THEN 1 END) as skipped
+    FROM logs
+    WHERE timestamp >= datetime('now', '-7 days')
+    AND type IN ('used', 'ping_used')
+  `),
+
+  lastWeekTotal: db.prepare(`
+    SELECT COUNT(*) as count, COALESCE(SUM(mg), 0) as totalMg,
+           COUNT(CASE WHEN type IN ('skipped', 'ping_skipped') THEN 1 END) as skipped
+    FROM logs
+    WHERE timestamp >= datetime('now', '-14 days')
+    AND timestamp < datetime('now', '-7 days')
+    AND type IN ('used', 'ping_used')
+  `),
+
+  // Skips in last 7 days
+  weekSkipCount: db.prepare(`
+    SELECT COUNT(*) as count FROM logs
+    WHERE type IN ('skipped', 'ping_skipped')
+    AND timestamp >= datetime('now', '-7 days')
+  `),
+
+  // Milestones
+  getMilestone: db.prepare('SELECT * FROM milestones WHERE key = ?'),
+  setMilestone: db.prepare('INSERT OR IGNORE INTO milestones (key) VALUES (?)'),
 };
 
 module.exports = { db, stmts };
