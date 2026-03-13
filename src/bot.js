@@ -178,18 +178,20 @@ async function checkMilestones() {
 
 // --- Ping Scheduling (fires X min after last use) ---
 
-function schedulePing() {
+function schedulePing(forceFullInterval = false) {
   if (pingTimeout) clearTimeout(pingTimeout);
 
   const phase = getCurrentPhase();
   const intervalMs = phase.intervalMin * 60 * 1000;
 
-  // Calculate delay based on last use time
-  const last = stmts.lastUsedTimestamp.get();
   let delay = intervalMs;
-  if (last?.timestamp) {
-    const elapsed = Date.now() - new Date(last.timestamp + 'Z').getTime();
-    delay = Math.max(intervalMs - elapsed, 0);
+  if (!forceFullInterval) {
+    // Calculate remaining time based on last use
+    const last = stmts.lastUsedTimestamp.get();
+    if (last?.timestamp) {
+      const elapsed = Date.now() - new Date(last.timestamp + 'Z').getTime();
+      delay = Math.max(intervalMs - elapsed, 0);
+    }
   }
 
   console.log(`Next ping in ${Math.round(delay / 60000)}min (interval: ${phase.intervalMin}min)`);
@@ -209,8 +211,8 @@ function schedulePing() {
       await msg.react('⏭️');
     }
 
-    // Schedule next ping (will wait full interval since no new use happened)
-    schedulePing();
+    // Don't auto-schedule here — wait for reaction response.
+    // If no response comes, the ping just stops until next use or skip.
   }, delay);
 }
 
@@ -561,6 +563,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
     if (lastPing && !lastPing.responded) {
       stmts.respondPing.run('skipped', lastPing.id);
     }
+    schedulePing(true); // full interval — no use happened
     await reaction.message.reply(`💪 Skipped | ${todaySummary()}`);
   }
 });
