@@ -1,5 +1,5 @@
 const express = require('express');
-const { stmts } = require('./db');
+const { db, stmts } = require('./db');
 const { getCurrentPhase, formatPhaseStatus, getDayNumber } = require('./taper');
 
 const app = express();
@@ -101,6 +101,31 @@ app.get('/api/snapshot', (_req, res) => {
       mg: phase.nextPhase.mg,
       intervalMin: phase.nextPhase.intervalMin,
     } : null,
+  });
+});
+
+// Full export for Google Sheets
+app.get('/api/export', (_req, res) => {
+  const allLogs = db.prepare(`
+    SELECT
+      id,
+      timestamp,
+      type,
+      mg,
+      date(timestamp) as day,
+      strftime('%H', timestamp) as hour
+    FROM logs
+    ORDER BY timestamp ASC
+  `).all();
+
+  const phase = getCurrentPhase();
+
+  res.json({
+    exportedAt: new Date().toISOString(),
+    taperStart: '2026-03-10',
+    currentDay: phase.day + 1,
+    currentPhase: phase.label,
+    logs: allLogs,
   });
 });
 
