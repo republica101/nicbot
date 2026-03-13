@@ -14,7 +14,8 @@ const client = new Client({
 });
 
 const USER_ID = process.env.DISCORD_USER_ID;
-let pingInterval = null;
+let pingTimeout = null;
+let pendingMgReply = null; // tracks DM channel awaiting mg follow-up
 
 // --- Helpers ---
 
@@ -55,25 +56,32 @@ function todaySummary() {
   return `${indicator} ${count}/${target} today | ${phase.mg}mg | last: ${formatTimeSince(last?.timestamp)}`;
 }
 
-// --- Ping Loop ---
+// --- Ping Scheduling (fires X min after last use) ---
 
-function startPingLoop() {
-  if (pingInterval) clearInterval(pingInterval);
+function schedulePing() {
+  if (pingTimeout) clearTimeout(pingTimeout);
 
   const phase = getCurrentPhase();
-  const ms = phase.intervalMin * 60 * 1000;
+  const intervalMs = phase.intervalMin * 60 * 1000;
 
-  console.log(`Ping loop started: every ${phase.intervalMin}min (${ms}ms)`);
+  // Calculate delay based on last use time
+  const last = stmts.lastUsedTimestamp.get();
+  let delay = intervalMs;
+  if (last?.timestamp) {
+    const elapsed = Date.now() - new Date(last.timestamp + 'Z').getTime();
+    delay = Math.max(intervalMs - elapsed, 0);
+  }
 
-  pingInterval = setInterval(async () => {
-    // Recalculate phase in case it changed
+  console.log(`Next ping in ${Math.round(delay / 60000)}min (interval: ${phase.intervalMin}min)`);
+
+  pingTimeout = setTimeout(async () => {
     const currentPhase = getCurrentPhase();
     const today = stmts.todayCount.get();
 
     stmts.logPing.run();
 
     const msg = await sendDM(
-      `⏰ **${currentPhase.intervalMin}min** — pouch? (today: ${today.count}/${currentPhase.dailyTarget}, ${currentPhase.mg}mg)\n\n✅ = used | ⏭️ = skipped`
+      `⏰ **${currentPhase.intervalMin}min since last** — pouch? (today: ${today.count}/${currentPhase.dailyTarget}, ${currentPhase.mg}mg)\n\n✅ = used | ⏭️ = skipped`
     );
 
     if (msg) {
@@ -81,12 +89,9 @@ function startPingLoop() {
       await msg.react('⏭️');
     }
 
-    // Check if interval needs updating for new phase
-    if (currentPhase.intervalMin !== phase.intervalMin) {
-      console.log(`Phase changed, restarting ping loop at ${currentPhase.intervalMin}min`);
-      startPingLoop();
-    }
-  }, ms);
+    // Schedule next ping (will wait full interval since no new use happened)
+    schedulePing();
+  }, delay);
 }
 
 // --- Server Command Handler ---
@@ -116,6 +121,28 @@ client.on('messageCreate', async (message) => {
   const content = message.content.trim().toLowerCase();
   const phase = getCurrentPhase();
 
+  // --- Handle pending mg follow-up from ping reaction ---
+  if (pendingMgReply) {
+    const elapsed = Date.now() - pendingMgReply.since;
+    // Expire after 5 minutes
+    if (elapsed > 5 * 60 * 1000) {
+      pendingMgReply = null;
+    } else {
+      pendingMgReply = null;
+      const mgMatch = content.match(/^(\d+)/);
+      const mg = mgMatch ? parseInt(mgMatch[1]) : phase.mg;
+      stmts.logUse.run('ping_used', mg, null);
+      schedulePing(); // reset ping timer after use
+
+      let reply = `📝 Logged ${mg}mg | ${todaySummary()}`;
+      if (mg > phase.mg) {
+        reply += `\n⚠️ Target is ${phase.mg}mg this phase`;
+      }
+      await message.reply(reply);
+      return;
+    }
+  }
+
   // --- Log a pouch: "1", "1 6", "1 4mg", "2", "2 4", etc ---
   const useMatch = content.match(/^(\d+)\s*(\d+)?\s*(mg)?$/);
   if (useMatch) {
@@ -125,6 +152,8 @@ client.on('messageCreate', async (message) => {
     for (let i = 0; i < count; i++) {
       stmts.logUse.run('used', mg, null);
     }
+
+    schedulePing(); // reset ping timer after use
 
     const today = stmts.todayCount.get();
     let reply = `📝 Logged ${count}x ${mg}mg | ${todaySummary()}`;
@@ -192,6 +221,70 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
+  // --- Graph (last 24h mg timeline) ---
+  if (content === 'graph' || content === 'g') {
+    const uses = stmts.last24hUses.all();
+    if (uses.length === 0) {
+      await message.reply('No usage in the last 24 hours.');
+      return;
+    }
+
+    // Build hourly buckets
+    const now = new Date();
+    const buckets = new Array(24).fill(0);
+    const bucketCounts = new Array(24).fill(0);
+
+    for (const row of uses) {
+      const t = new Date(row.timestamp + 'Z');
+      const hoursAgo = Math.floor((now - t) / 3600000);
+      const idx = 23 - Math.min(hoursAgo, 23);
+      buckets[idx] += row.mg || 0;
+      bucketCounts[idx]++;
+    }
+
+    const maxMg = Math.max(...buckets, 1);
+    const barHeight = 6;
+
+    let chart = '📊 **Last 24h — mg per hour**\n```\n';
+
+    // Rows top to bottom
+    for (let row = barHeight; row >= 1; row--) {
+      const threshold = (row / barHeight) * maxMg;
+      let line = `${String(Math.round(threshold)).padStart(3)}│`;
+      for (let col = 0; col < 24; col++) {
+        line += buckets[col] >= threshold ? '█' : ' ';
+      }
+      chart += line + '\n';
+    }
+
+    // X-axis
+    chart += '   └' + '─'.repeat(24) + '\n';
+
+    // Hour labels (every 6h)
+    const hourLabels = '    ';
+    const labelParts = [];
+    for (let i = 0; i < 24; i++) {
+      const h = new Date(now - (23 - i) * 3600000);
+      if (i % 6 === 0) {
+        labelParts.push(String(h.getHours()).padStart(2, '0'));
+      } else if (i % 6 === 1 && i > 0) {
+        // skip — part of the 2-char label
+      } else {
+        labelParts.push(' ');
+      }
+    }
+    chart += '    ' + labelParts.join('') + '\n';
+
+    // Summary line
+    const totalMg = buckets.reduce((a, b) => a + b, 0);
+    const totalCount = bucketCounts.reduce((a, b) => a + b, 0);
+    chart += `\nTotal: ${totalCount} pouches, ${totalMg}mg`;
+    chart += '```';
+
+    await message.reply(chart);
+    return;
+  }
+
   // --- Help ---
   if (content === 'help' || content === 'h' || content === '?') {
     await message.reply(
@@ -202,6 +295,7 @@ client.on('messageCreate', async (message) => {
       '`undo` / `u` — remove last entry\n' +
       '`status` / `st` — current phase + today\'s count\n' +
       '`stats` / `week` — last 7 days summary\n' +
+      '`graph` / `g` — last 24h mg usage graph\n' +
       '`help` / `h` — this message'
     );
     return;
@@ -222,11 +316,12 @@ client.on('messageReactionAdd', async (reaction, user) => {
   const lastPing = stmts.lastPing.get();
 
   if (reaction.emoji.name === '✅') {
-    stmts.logUse.run('ping_used', phase.mg, null);
     if (lastPing && !lastPing.responded) {
       stmts.respondPing.run('used', lastPing.id);
     }
-    await reaction.message.reply(`📝 Logged ${phase.mg}mg | ${todaySummary()}`);
+    // Ask for mg instead of auto-logging
+    pendingMgReply = { since: Date.now() };
+    await reaction.message.reply(`How many mg? (default: ${phase.mg}mg — just hit enter or type a number)`);
   } else if (reaction.emoji.name === '⏭️') {
     stmts.logUse.run('ping_skipped', null, null);
     if (lastPing && !lastPing.responded) {
@@ -240,7 +335,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
 
 client.once('ready', () => {
   console.log(`NicBot online as ${client.user.tag}`);
-  startPingLoop();
+  schedulePing();
 });
 
 function login() {

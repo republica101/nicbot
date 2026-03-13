@@ -85,6 +85,13 @@ const stmts = {
     WHERE type IN ('used', 'ping_used')
     ORDER BY timestamp DESC LIMIT 1
   `),
+
+  last24hUses: db.prepare(`
+    SELECT timestamp, mg FROM logs
+    WHERE type IN ('used', 'ping_used')
+    AND timestamp >= datetime('now', '-24 hours')
+    ORDER BY timestamp ASC
+  `),
 };
 
 module.exports = { db, stmts };
